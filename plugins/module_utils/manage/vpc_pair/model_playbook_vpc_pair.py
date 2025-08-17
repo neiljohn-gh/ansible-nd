@@ -27,7 +27,7 @@ except (ImportError, ValueError) as error:
 #
 # This is used to satisfy the ansible sanity test requirements
 try:
-    from pydantic import BaseModel, ConfigDict, Field, field_validator
+    from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 except ImportError as imp_exc:
     PYDANTIC_IMPORT_ERROR = imp_exc
 
@@ -45,6 +45,17 @@ except ImportError as imp_exc:
     def field_validator(*args, **kwargs):
         """
         A placeholder for field_validator to maintain compatibility with Pydantic.
+        This will not perform any validation but allows the code to run without errors.
+        """
+
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def model_validator(*args, **kwargs):
+        """
+        A placeholder for model_validator to maintain compatibility with Pydantic.
         This will not perform any validation but allows the code to run without errors.
         """
 
@@ -100,19 +111,19 @@ class VpcPairModel(BaseModel):
 
     # Required fields for playbook configuration
     peer1SwitchId: str = Field(
-        alias="peer1_switch_id",
+        alias="peerOneId",
         description="Serial number of the first switch in the VPC pair"
     )
-    peer2SwitchId: str = Field(
-        alias="peer2_switch_id", 
+    peer2SwitchId: Optional[str] = Field(
+        default=None,
+        alias="peerTwoId",
         description="Serial number of the second switch in the VPC pair"
     )
     useVirtualPeerLink: bool = Field(
         default=False,
-        alias="use_virtual_Pair_link",
         description="Whether to use virtual peer link for the VPC pair"
     )
-
+    
     # # Optional fields for API response data
     # description: Optional[str] = Field(
     #     default=None,
@@ -151,12 +162,13 @@ class VpcPairModel(BaseModel):
 
     @field_validator("peer1SwitchId", "peer2SwitchId", mode="before")
     @classmethod
-    def validate_switch_ids(cls, value: str) -> str:
+    def validate_switch_ids(cls, value: str, info) -> str:
         """
         Validates switch serial numbers.
         
         Args:
             value: The switch serial number to validate.
+            info: Field validation info containing field name.
             
         Returns:
             str: The validated switch serial number.
@@ -164,6 +176,18 @@ class VpcPairModel(BaseModel):
         Raises:
             ValueError: If the switch ID is empty or not a string.
         """
+        if value is None:
+            return value
+            
+        # Handle empty strings for optional peer2SwitchId
+        if isinstance(value, str) and value.strip() == "":
+            if info.field_name == "peer2SwitchId":
+                mainlog.debug("Empty string provided for optional peer2SwitchId, converting to None")
+                return None
+            else:
+                mainlog.error(f"Invalid switch ID: empty string provided for required field {info.field_name}")
+                raise ValueError("Switch ID must be a non-empty string.")
+        
         mainlog.debug(f"Validating switch ID: {value}")
         if not value or not isinstance(value, str):
             mainlog.error(f"Invalid switch ID: {value}. Must be a non-empty string.")
@@ -171,6 +195,36 @@ class VpcPairModel(BaseModel):
         validated_value = value.strip()
         mainlog.debug(f"Switch ID validation successful: {validated_value}")
         return validated_value
+
+    @model_validator(mode="after")
+    def validate_different_switch_ids(self) -> "VpcPairModel":
+        """
+        Validates that peer1SwitchId and peer2SwitchId are different when both are present.
+        Also ensures consistent ordering by sorting peer1 and peer2 switch IDs.
+        
+        Returns:
+            VpcPairModel: The validated model instance.
+            
+        Raises:
+            ValueError: If both switch IDs are the same.
+        """
+        mainlog.debug(f"Validating switch IDs are different: peer1={self.peer1SwitchId}, peer2={self.peer2SwitchId}")
+        
+        # Check if peer2SwitchId is present and both IDs are the same
+        if self.peer2SwitchId and self.peer1SwitchId == self.peer2SwitchId:
+            mainlog.error(f"Invalid VPC pair: peer1SwitchId and peer2SwitchId cannot be the same: {self.peer1SwitchId}, {self.peer2SwitchId}")
+            raise ValueError("peer1SwitchId and peer2SwitchId must be different")
+        
+        # Sort peer1 and peer2 to ensure consistent ordering when both are present
+        if self.peer2SwitchId:
+            switches = sorted([self.peer1SwitchId, self.peer2SwitchId])
+            if switches[0] != self.peer1SwitchId or switches[1] != self.peer2SwitchId:
+                mainlog.debug(f"Reordering switches for consistency: {self.peer1SwitchId}, {self.peer2SwitchId} -> {switches[0]}, {switches[1]}")
+                object.__setattr__(self, 'peer1SwitchId', switches[0])
+                object.__setattr__(self, 'peer2SwitchId', switches[1])
+        
+        mainlog.debug("Switch ID difference validation successful")
+        return self
 
     # @field_validator("domain_id", mode="before")
     # @classmethod
@@ -248,17 +302,80 @@ class VpcPairModel(BaseModel):
         return payload
 
     @classmethod
-    def get_model(cls, data: dict) -> "VpcPairModel":
+    def get_model(cls, data: dict, state: str = None, extra: str = "ignore", sw_sn_from_ip: dict = None) -> "VpcPairModel":
         """
         Create a VpcPairModel instance from dict.
         
         Args:
             data: Dictionary containing data for the VPC pair.
+            state: The state parameter to determine validation requirements.
+            extra: If "forbid", emulates extra="forbid" behavior by rejecting unexpected fields.
+            sw_sn_from_ip: Dictionary mapping switch IP addresses to serial numbers.
 
         Returns:
             VpcPairModel: A new instance populated for the VPC pair.
         """
-        mainlog.debug(f"Creating VpcPairModel from VPC pair data: {data}")
-        instance = cls(**data)
+        mainlog.debug(f"Creating VpcPairModel from VPC pair data: {data}, state: {state}, extra: {extra}")
+        
+        # Create a copy to avoid modifying the original data
+        processed_data = data.copy()
+        
+        # Handle both naming conventions for peer1_switch_id
+        if processed_data.get("peerOneId"):
+            processed_data["peer1SwitchId"] = processed_data.pop("peerOneId")
+        
+        # Handle both naming conventions for peer2_switch_id  
+        if processed_data.get("peerTwoId"):
+            processed_data["peer2SwitchId"] = processed_data.pop("peerTwoId")
+            
+        # Convert IP addresses to serial numbers if mapping is provided
+        if sw_sn_from_ip:
+            if processed_data.get("peer1SwitchId"):
+                original_peer1 = processed_data["peer1SwitchId"]
+                processed_data["peer1SwitchId"] = sw_sn_from_ip.get(original_peer1, original_peer1)
+                # If conversion didn't happen and state is not query, check if it's a valid serial number in the fabric
+                if (state and state.lower() != "query" and 
+                    processed_data["peer1SwitchId"] == original_peer1 and 
+                    original_peer1 not in sw_sn_from_ip.values()):
+                    raise ValueError(f"peer1SwitchId '{original_peer1}' not found in fabric inventory. Must be either a valid switch IP address or serial number. Available IP-SN: {sw_sn_from_ip}")
+            
+            if processed_data.get("peer2SwitchId"):
+                original_peer2 = processed_data["peer2SwitchId"] 
+                processed_data["peer2SwitchId"] = sw_sn_from_ip.get(original_peer2, original_peer2)
+                # If conversion didn't happen and state is not query, check if it's a valid serial number in the fabric
+                if (state and state.lower() != "query" and 
+                    processed_data["peer2SwitchId"] == original_peer2 and 
+                    original_peer2 not in sw_sn_from_ip.values()):
+                    raise ValueError(f"peer2SwitchId '{original_peer2}' not found in fabric inventory. Must be either a valid switch IP address or serial number. Available IP-SN: {sw_sn_from_ip}")
+        
+        # Emulate extra="forbid" behavior if strict mode is enabled
+        if extra == "forbid":
+            # Get all valid field names including aliases
+            valid_fields = set()
+            for field_name, field_info in cls.model_fields.items():
+                valid_fields.add(field_name)
+                if hasattr(field_info, 'alias') and field_info.alias:
+                    valid_fields.add(field_info.alias)
+            
+            # Check for unexpected fields
+            unexpected_fields = set(processed_data.keys()) - valid_fields
+            if unexpected_fields:
+                mainlog.error(f"Unexpected fields found in extra=forbid mode: {unexpected_fields}")
+                raise ValueError(f"Unexpected fields not allowed in extra=forbid mode: {', '.join(sorted(unexpected_fields))}")
+        
+        # Validate that peer2SwitchId is present when state is not "query"
+        if not state or state.lower() != "query":
+            peer2_switch_id = processed_data.get("peer2_switch_id") or processed_data.get("peer2SwitchId")
+            if not peer2_switch_id:
+                mainlog.error(f"peer2SwitchId is required when state is '{state}'")
+                raise ValueError(f"peer2SwitchId is required when state is '{state}'")
+        
+        # Validate that useVirtualPeerLink should not be set for query or deleted states
+        if state and state.lower() in ["query", "deleted"]:
+            if processed_data.get("useVirtualPeerLink") is not None:
+                mainlog.error(f"useVirtualPeerLink should not be set when state is '{state}'.")
+                raise ValueError(f"useVirtualPeerLink should not be set when state is '{state}'.")
+        
+        instance = cls(**processed_data)
         mainlog.debug(f"Successfully created VpcPairModel instance: {instance}")
         return instance
