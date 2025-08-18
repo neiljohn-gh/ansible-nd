@@ -32,6 +32,25 @@ options:
         description:
         - The state of the vPC pair configuration after module completion.
         type: str
+    deploy:
+        description:
+        - Deploy the configuration changes to the fabric after applying them.
+        - When true, automatically saves the configuration and then triggers a fabric deployment via POST to /api/v1/manage/fabrics/{fabric}/actions/deploy?forceShowRun=true
+        - Configuration is saved via POST to /api/v1/manage/fabrics/{fabric}/actions/configSave before deployment.
+        - Deployment only occurs if there are actual changes (diff is not empty), pending operations, or switches in transitional states.
+        - Cannot be used when state is 'query'.
+        - Only applicable for states that modify configuration (merged, replaced, deleted, overridden).
+        type: bool
+        default: false
+    dry_run:
+        description:
+        - When true, shows what changes would be made without actually executing them.
+        - Displays all API requests that would be sent, the diff of changes, and whether deployment would occur.
+        - No actual configuration changes are made to the fabric.
+        - Useful for validating configurations and understanding what operations would be performed.
+        - Cannot be used when state is 'query'.
+        type: bool
+        default: false
     config:
         description:
         - A list of vPC pair configuration dictionaries.
@@ -136,6 +155,66 @@ EXAMPLES = """
 - name: Override without any new vPC pairs
   cisco.nd.nd_manage_vpc_pairs:
     state: overridden
+
+# Create vPC pair and deploy the configuration changes
+# Note: When deploy=true, deployment only occurs if there are actual changes or pending operations
+# Configuration is automatically saved before deployment
+- name: Create vPC pair and deploy changes
+  cisco.nd.nd_manage_vpc_pairs:
+    state: merged
+    deploy: true
+    config:
+      - peer1_switch_id: "FDO23040Q85"
+        peer2_switch_id: "FDO23040Q86"
+        useVirtualPeerLink: true
+
+# Use dry run to preview what changes would be made without executing them
+# Shows all planned API requests, diff information, and deployment decision
+- name: Preview vPC pair changes with dry run
+  cisco.nd.nd_manage_vpc_pairs:
+    state: merged
+    deploy: true
+    dry_run: true
+    config:
+      - peer1_switch_id: "FDO23040Q85"
+        peer2_switch_id: "FDO23040Q86"
+        useVirtualPeerLink: true
+
+# Dry run to check what deployment actions would be taken
+- name: Preview deployment actions only
+  cisco.nd.nd_manage_vpc_pairs:
+    state: query
+    deploy: true
+    dry_run: true
+- name: Create vPC pair with deployment
+  cisco.nd.nd_manage_vpc_pairs:
+    state: merged
+    deploy: true
+    config:
+      - peer1_switch_id: "FDO23040Q85"
+        peer2_switch_id: "FDO23040Q86"
+        useVirtualPeerLink: true
+
+# Replace vPC pair configuration and deploy changes
+# Note: Configuration save and deploy happen automatically when deploy=true
+- name: Replace vPC pair with deployment
+  cisco.nd.nd_manage_vpc_pairs:
+    state: replaced
+    deploy: true
+    config:
+      - peer1_switch_id: "FDO23040Q85"
+        peer2_switch_id: "FDO23040Q86"
+        useVirtualPeerLink: false
+
+# Delete vPC pair and deploy the changes
+# Note: Configuration is saved automatically before deployment
+- name: Delete vPC pair with deployment
+  cisco.nd.nd_manage_vpc_pairs:
+    state: deleted
+    deploy: true
+    config:
+      - peer1_switch_id: "FDO23040Q85"
+        peer2_switch_id: "FDO23040Q86"
 """
 
 RETURN = """
@@ -145,22 +224,47 @@ changed:
     returned: always
     sample: true
 diff:
-    description: List of differences between desired and current state
-    type: list
+    description: Dictionary of configurations grouped by operation type (POST, PUT, DELETE). Only populated with keys for operations that were actually performed.
+    type: dict
     returned: always
-    sample: []
+    sample: {
+        "POST": [
+            {
+                "peer1SwitchId": "FDO23040Q85",
+                "peer2SwitchId": "FDO23040Q86",
+                "useVirtualPeerLink": true
+            }
+        ],
+        "PUT": [
+            {
+                "peer1SwitchId": "FDO23040Q85",
+                "peer2SwitchId": "FDO23040Q86",
+                "useVirtualPeerLink": false
+            }
+        ]
+    }
 response:
-    description: API response from the Nexus Dashboard
+    description: List of API responses from the Nexus Dashboard with operation context
     type: list
     returned: always
-    sample: []
+    sample: [
+        {
+            "vpc_pair_key": "FDO23040Q85-FDO23040Q86",
+            "operation": "POST",
+            "path": "/api/v1/manage/fabrics/fabric1/vpcPairs",
+            "response": {
+                "status": "success",
+                "message": "vPC pair created successfully"
+            }
+        }
+    ]
 warnings:
     description: List of warning messages
     type: list
     returned: when applicable
     sample: []
 query:
-    description: Current state of vPC pairs (only returned in query state)
+    description: Current state of vPC pairs (only returned in query state). The pending_create_vpc_pairs and pending_delete_vpc_pairs keys are only included if there are items in those lists.
     type: dict
     returned: when state is query
     sample: {
@@ -453,10 +557,12 @@ class Common:
         self.class_name = self.__class__.__name__
         self.log = logger or logging.getLogger(f"nd.{self.class_name}")
 
-        self.result = dict(changed=False, diff=[], response=[], warnings=[])
+        self.result = dict(changed=False, diff={}, response=[], warnings=[])
         self.task_params = task_params
         self.state = task_params["state"]
         self.fabric = task_params["fabric"]
+        self.deploy = task_params.get("deploy", False)
+        self.dry_run = task_params.get("dry_run", False)
         self.requests = {}
         self.nd = nd_instance
         self.inventory = inventory
@@ -467,7 +573,7 @@ class Common:
         self.pending_delete_vpc_pairs = []
         self.pending_create_vpc_pairs = []
         msg = "ENTERED Common(): "
-        msg += f"state: {self.state}, "
+        msg += f"state: {self.state}, dry_run: {self.dry_run}, "
         self.log.debug(msg)
         self.validate_task_params()
 
@@ -495,21 +601,24 @@ class Common:
         # check if we need to only work with switches in the fabric
         unique_switches_want = set()
         for vpc_pair in self.task_params.get("config", []):
-            validated_config = VpcPairModel.get_model(
-                vpc_pair, 
-                state=self.state, 
-                extra="forbid",
-                sw_sn_from_ip=self.inventory.sw_sn_from_ip
-            )
+            try:
+                validated_config = VpcPairModel.get_model(
+                    vpc_pair, 
+                    state=self.state, 
+                    extra="forbid",
+                    sw_sn_from_ip=self.inventory.sw_sn_from_ip
+                )
+            except ValueError as error:
+                self.nd.fail_json(msg=f"Invalid vPC pair configuration: {str(error)}")
             
             # Check uniqueness after Pydantic validation
             if validated_config.peer2SwitchId and validated_config.peer2SwitchId in unique_switches_want:
-                raise ValueError(f"Switch IDs must be unique across vPC pairs: {validated_config.peer2SwitchId}")
+                self.nd.fail_json(msg=f"Switch IDs must be unique across vPC pairs: {validated_config.peer2SwitchId}")
             if validated_config.peer2SwitchId:
                 unique_switches_want.add(validated_config.peer2SwitchId)
 
             if validated_config.peer1SwitchId in unique_switches_want:
-                raise ValueError(f"Switch IDs must be unique across vPC pairs: {validated_config.peer1SwitchId}")
+                self.nd.fail_json(msg=f"Switch IDs must be unique across vPC pairs: {validated_config.peer1SwitchId}")
             unique_switches_want.add(validated_config.peer1SwitchId)
             
             self.want.append(validated_config)
@@ -603,9 +712,207 @@ class Common:
                 f"Conflicts found:\n" + "\n".join(f"- {conflict}" for conflict in conflicts)
             )
             self.log.error(error_msg)
-            raise ValueError(error_msg)
+            self.nd.fail_json(msg=error_msg)
         
         self.log.debug("No switch conflicts found in vpc pairs validation")
+
+    def save_fabric_config(self):
+        """
+        Save the fabric configuration before deploying changes.
+        
+        This method sends a POST request to the fabric config save endpoint to save
+        the current configuration state. This should be called before deploying
+        configuration changes.
+        
+        Returns:
+            dict: Response from the config save API call
+            
+        Raises:
+            Exception: If the config save operation fails
+        """
+        self.class_name = self.__class__.__name__
+        method_name = inspect.stack()[0][3]
+        msg = f"ENTERED: {self.class_name}.{method_name}"
+        self.log.debug(msg)
+        
+        # Don't save if state is query
+        if self.state == "query":
+            self.log.debug("Skipping config save for query state")
+            return None
+            
+        # Don't save if deploy parameter is False (no need to save if we're not deploying)
+        if not self.deploy:
+            self.log.debug("Deploy parameter is False, skipping config save")
+            return None
+            
+        config_save_path = f"/api/v1/manage/fabrics/{self.fabric}/actions/configSave"
+        self.log.info(f"Saving fabric configuration via: {config_save_path}")
+        
+        try:
+            response = self.nd.request(config_save_path, method="POST", data={})
+            self.log.debug("Config save response: %s", response)
+            
+            # Store config save response with additional context
+            config_save_response_entry = {
+                "operation": "CONFIG_SAVE",
+                "path": config_save_path, 
+                "response": response
+            }
+            self.result["response"].append(config_save_response_entry)
+            
+            return response
+            
+        except Exception as error:
+            error_msg = f"Failed to save fabric configuration: {str(error)}"
+            self.log.error(error_msg)
+            self.nd.fail_json(msg=error_msg)
+
+    def needs_deployment(self):
+        """
+        Determine if deployment is needed based on current state and changes.
+        
+        Deployment is needed if any of the following conditions are met:
+        1. There are items in the diff (actual configuration changes were made)
+        2. There are pending create vPC pairs (switches ready to be paired)
+        3. There are pending delete vPC pairs (switches ready to be unpaired)
+        4. There are any requests in the requests dictionary (operations to be performed)
+        
+        Returns:
+            bool: True if deployment is needed, False otherwise
+        """
+        self.class_name = self.__class__.__name__
+        method_name = inspect.stack()[0][3]
+        msg = f"ENTERED: {self.class_name}.{method_name}"
+        self.log.debug(msg)
+        
+        # Check if there are any changes in the diff
+        has_diff_changes = any(
+            self.result.get("diff", {}).get(operation, [])
+            for operation in ["POST", "PUT", "DELETE"]
+        )
+        
+        # Check if there are pending operations
+        has_pending_create = bool(self.pending_create_vpc_pairs)
+        has_pending_delete = bool(self.pending_delete_vpc_pairs)
+        
+        # Check if there are any API requests to be made
+        has_requests = bool(self.requests)
+        
+        self.log.debug(f"Deployment needs assessment:")
+        self.log.debug(f"  - Has diff changes: {has_diff_changes}")
+        self.log.debug(f"  - Has pending create pairs: {has_pending_create} (count: {len(self.pending_create_vpc_pairs)})")
+        self.log.debug(f"  - Has pending delete pairs: {has_pending_delete} (count: {len(self.pending_delete_vpc_pairs)})")
+        self.log.debug(f"  - Has API requests: {has_requests} (count: {len(self.requests)})")
+        
+        deployment_needed = has_diff_changes or has_pending_create or has_pending_delete or has_requests
+        
+        self.log.info(f"Deployment needed: {deployment_needed}")
+        return deployment_needed
+
+    def deploy_fabric(self):
+        """
+        Deploy the fabric configuration changes after applying vPC pair operations.
+        
+        This method first checks if deployment is actually needed based on:
+        - Presence of configuration changes (diff)
+        - Pending create/delete vPC pairs
+        - Any API requests that were made
+        
+        If deployment is needed, it saves the current configuration and then sends a POST request 
+        to the fabric deploy endpoint. It should only be called after all other vPC pair operations 
+        have been completed successfully.
+        
+        Returns:
+            dict: Response from the deploy API call, or None if deployment is not needed
+            
+        Raises:
+            Exception: If the config save or deploy operation fails
+        """
+        self.class_name = self.__class__.__name__
+        method_name = inspect.stack()[0][3]
+        msg = f"ENTERED: {self.class_name}.{method_name}"
+        self.log.debug(msg)
+        
+        # Don't deploy if state is query
+        if self.state == "query":
+            self.log.debug("Skipping deploy for query state")
+            return None
+            
+        # Don't deploy if deploy parameter is False
+        if not self.deploy:
+            self.log.debug("Deploy parameter is False, skipping deployment")
+            return None
+        
+        # Check if deployment is actually needed
+        if not self.needs_deployment():
+            self.log.info("No configuration changes or pending operations detected, skipping deployment")
+            return None
+        
+        # Save configuration before deploying
+        self.log.info("Configuration changes detected, saving fabric configuration before deployment")
+        self.save_fabric_config()
+            
+        deploy_path = f"/api/v1/manage/fabrics/{self.fabric}/actions/deploy?forceShowRun=true"
+        self.log.info(f"Deploying fabric configuration changes via: {deploy_path}")
+        
+        try:
+            response = self.nd.request(deploy_path, method="POST", data={})
+            self.log.debug("Deploy response: %s", response)
+            
+            # Store deploy response with additional context
+            deploy_response_entry = {
+                "operation": "DEPLOY",
+                "path": deploy_path, 
+                "response": response
+            }
+            self.result["response"].append(deploy_response_entry)
+            
+            # Mark as changed if deploy was triggered
+            self.result["changed"] = True
+            
+            return response
+            
+        except Exception as error:
+            error_msg = f"Failed to deploy fabric configuration: {str(error)}"
+            self.log.error(error_msg)
+            self.nd.fail_json(msg=error_msg)
+
+    def show_dry_run_deployment_info(self):
+        """
+        Show what deployment actions would be taken in dry run mode.
+        
+        This method evaluates whether deployment would occur and provides
+        detailed information about the deployment decision factors without
+        actually performing the deployment.
+        """
+        self.class_name = self.__class__.__name__
+        method_name = inspect.stack()[0][3]
+        msg = f"ENTERED: {self.class_name}.{method_name}"
+        self.log.debug(msg)
+        
+        deployment_needed = self.needs_deployment()
+        
+        deployment_info = {
+            "would_deploy": deployment_needed,
+            "deployment_decision_factors": {
+                "diff_has_changes": bool(self.result.get("diff", {}).get("after") != self.result.get("diff", {}).get("before")),
+                "pending_operations": bool(self.pending_create_vpc_pairs or self.pending_delete_vpc_pairs),
+                "api_requests_generated": bool(self.result.get("response", []))
+            }
+        }
+        
+        if deployment_needed:
+            deployment_info["planned_actions"] = [
+                f"POST /api/v1/manage/fabrics/{self.fabric}/actions/configSave",
+                f"POST /api/v1/manage/fabrics/{self.fabric}/actions/deploy?forceShowRun=true"
+            ]
+            self.log.info("DRY RUN: Would deploy fabric configuration changes")
+        else:
+            deployment_info["reason_skipped"] = "No changes detected (diff empty, no pending operations, no API requests)"
+            self.log.info("DRY RUN: Would skip deployment - no changes detected")
+        
+        # Store deployment info in result
+        self.result["deployment"] = deployment_info
 
 
 
@@ -1132,11 +1439,11 @@ class Query:
     
     def get_query_results(self):
         """
-        Retrieve the current state of vPC pairs including pending create and delete lists.
+        Retrieve the current state of vPC pairs including pending create and delete lists when they contain items.
 
         This method collects the current state of vPC pairs from the have state
-        and prepares it for output in the query result format. It also includes
-        separate lists for pending create and delete vpc pairs.
+        and prepares it for output in the query result format. It conditionally includes
+        separate lists for pending create and delete vpc pairs only if they contain items.
 
         When no specific search criteria (want) is provided, all vPC pairs are returned.
         When search criteria is provided, only matching vPC pairs are included in all lists.
@@ -1144,29 +1451,31 @@ class Query:
         Returns:
             dict: A dictionary containing:
                 - query: A nested dictionary with:
-                    - vpc_pairs: List of active vPC pair configurations (matching search criteria if provided)
-                    - pending_create_vpc_pairs: List of vPC pairs pending creation (filtered by search criteria if provided)
-                    - pending_delete_vpc_pairs: List of vPC pairs pending deletion (filtered by search criteria if provided)
+                    - vpc_pairs: List of active vPC pair configurations (always present, may be empty)
+                    - pending_create_vpc_pairs: List of vPC pairs pending creation (only if items exist)
+                    - pending_delete_vpc_pairs: List of vPC pairs pending deletion (only if items exist)
         """
         self.class_name = self.__class__.__name__
         method_name = inspect.stack()[0][3]  # pylint: disable=unused-variable
         msg = f"ENTERED: {self.class_name}.{method_name}"
         self.log.debug(msg)
         
-        # Initialize result dictionary
+        # Initialize result dictionary with vpc_pairs (always present)
         results = {
             "query": {
-                "vpc_pairs": [],
-                "pending_create_vpc_pairs": [],
-                "pending_delete_vpc_pairs": []
+                "vpc_pairs": []
             }
         }
         
         if not self.common.want:
             # Return all vPC pairs when no specific search criteria provided
             results["query"]["vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in self.common.have]
-            results["query"]["pending_create_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in self.common.pending_create_vpc_pairs]
-            results["query"]["pending_delete_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in self.common.pending_delete_vpc_pairs]
+            
+            # Only add pending lists if they contain items
+            if self.common.pending_create_vpc_pairs:
+                results["query"]["pending_create_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in self.common.pending_create_vpc_pairs]
+            if self.common.pending_delete_vpc_pairs:
+                results["query"]["pending_delete_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in self.common.pending_delete_vpc_pairs]
         else:
             # Search for specific vPC pairs in have, pending_create, and pending_delete lists
             # Also filter pending lists based on want criteria
@@ -1213,10 +1522,14 @@ class Query:
                 if found_vpc_pair:
                     pending_delete_filtered.append(found_vpc_pair)
             
-            # Set filtered lists in nested structure
+            # Set filtered lists in nested structure - vpc_pairs always present
             results["query"]["vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in query_filtered]
-            results["query"]["pending_create_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in pending_create_filtered]
-            results["query"]["pending_delete_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in pending_delete_filtered]
+            
+            # Only add pending lists if they contain filtered items
+            if pending_create_filtered:
+                results["query"]["pending_create_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in pending_create_filtered]
+            if pending_delete_filtered:
+                results["query"]["pending_delete_vpc_pairs"] = [vpc_pair.model_dump() for vpc_pair in pending_delete_filtered]
         
         return results
         
@@ -1231,6 +1544,8 @@ def main():
         ),
         fabric=dict(required=True, type="str"),
         config=dict(required=False, type="list", elements="dict"),
+        deploy=dict(required=False, type="bool", default=False),
+        dry_run=dict(required=False, type="bool", default=False),
     )
 
     module = AnsibleModule(
@@ -1243,6 +1558,14 @@ def main():
 
     if not HAS_DEEPDIFF:
         module.fail_json(msg=missing_required_lib("deepdiff"), exception=DEEPDIFF_IMPORT_ERROR)
+
+    # Validate that deploy is not used with query state
+    if module.params.get("state") == "query" and module.params.get("deploy"):
+        module.fail_json(msg="Deploy parameter cannot be used with 'query' state")
+
+    # Validate that dry_run is not used with query state
+    if module.params.get("state") == "query" and module.params.get("dry_run"):
+        module.fail_json(msg="Dry_run parameter cannot be used with 'query' state")
 
     # Logging setup
     try:
@@ -1261,7 +1584,10 @@ def main():
     inventory = UpdateInventory(nd)
     inventory.refresh()
 
-    vpc_pairs = Common(task_params, nd, inventory)
+    try:
+        vpc_pairs = Common(task_params, nd, inventory)
+    except ValueError as error:
+        module.fail_json(msg=f"Configuration validation error: {str(error)}")
 
     vp_have = GetHave(nd, inventory)
     vp_have.refresh()
@@ -1310,20 +1636,96 @@ def main():
         for vpc_pair_key, request_data in task.common.requests.items():
             verb = request_data["verb"]
             path = request_data["path"]
-            payload = request_data["payload"]
+            payload = request_data.get("payload", {})
             mainlog.debug("Processing request for vPC pair key: %s", vpc_pair_key)
             mainlog.debug("Verb: %s, Path: %s, Payload: %s", verb, path, payload)
+            
+            # Add payload/config to diff grouped by operation type
+            if verb in ["POST", "PUT", "DELETE"]:
+                # Ensure the operation key exists in diff
+                if verb not in task.common.result["diff"]:
+                    task.common.result["diff"][verb] = []
+                
+                if verb == "DELETE":
+                    # For DELETE operations, extract switch IDs from vpc_pair_key or path
+                    switch_ids = vpc_pair_key.replace("delete_", "").split("-")
+                    if len(switch_ids) >= 2:
+                        delete_config = {
+                            "peer1SwitchId": switch_ids[0],
+                            "peer2SwitchId": switch_ids[1]
+                        }
+                    else:
+                        # Fallback: try to extract from path or use vpc_pair_key
+                        delete_config = {"vpc_pair_key": vpc_pair_key}
+                    task.common.result["diff"][verb].append(delete_config)
+                elif verb == "PUT":
+                    # For PUT operations, include switch IDs along with the payload
+                    switch_ids = vpc_pair_key.replace("delete_", "").split("-")
+                    if len(switch_ids) >= 2 and payload:
+                        put_config = {
+                            "peer1SwitchId": switch_ids[0],
+                            "peer2SwitchId": switch_ids[1]
+                        }
+                        # Merge the payload into the config
+                        put_config.update(payload)
+                        task.common.result["diff"][verb].append(put_config)
+                    elif payload:
+                        # Fallback: just use payload if switch IDs can't be extracted
+                        task.common.result["diff"][verb].append(payload)
+                else:
+                    # For POST, use the actual payload (which should already include switch IDs)
+                    if payload:
+                        task.common.result["diff"][verb].append(payload)
+            
             # Pretty-print the payload for easier log reading
             pretty_payload = json.dumps(payload, indent=2, sort_keys=True)
-            mainlog.info("Calling nd.request with path: %s, verb: %s, and payload:\n%s", path, verb, pretty_payload)
-            # Make the API request
-            response = nd.request(path, method=verb, data=payload if payload else None)
-            mainlog.debug("Response from nd.request: %s", response)
-            task.common.result["response"].append(response)
-            task.common.result["changed"] = True
+            
+            if task.common.dry_run:
+                # In dry run mode, don't make actual API calls but log what would be done
+                mainlog.info("DRY RUN: Would call nd.request with path: %s, verb: %s, and payload:\n%s", path, verb, pretty_payload)
+                
+                # Store dry run request information
+                response_entry = {
+                    "vpc_pair_key": vpc_pair_key,
+                    "operation": verb,
+                    "path": path,
+                    "payload": payload,
+                    "dry_run": True,
+                    "response": "DRY RUN - No actual API call made"
+                }
+            else:
+                # Normal mode - make actual API request
+                mainlog.info("Calling nd.request with path: %s, verb: %s, and payload:\n%s", path, verb, pretty_payload)
+                
+                # Make the API request
+                response = nd.request(path, method=verb, data=payload if payload else None)
+                mainlog.debug("Response from nd.request: %s", response)
+                
+                # Store response with additional context
+                response_entry = {
+                    "vpc_pair_key": vpc_pair_key,
+                    "operation": verb,
+                    "path": path,
+                    "response": response
+                }
+            
+            task.common.result["response"].append(response_entry)
+            
+            # Only mark as changed if not in dry run mode
+            if not task.common.dry_run:
+                task.common.result["changed"] = True
     else:
         mainlog.info("No requests to process")
 
+    # Deploy fabric changes if deploy parameter is True and state is not query
+    if task.common.deploy and task.common.state != "query":
+        if task.common.dry_run:
+            mainlog.info("DRY RUN: Showing deployment information without executing")
+            task.common.show_dry_run_deployment_info()
+        else:
+            mainlog.info("Deploy parameter is True, deploying fabric configuration changes")
+            task.common.deploy_fabric()
+    
     module.exit_json(**task.common.result)
 
 
